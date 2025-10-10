@@ -612,12 +612,8 @@ def device_blas_matmul(a, b):
     N, K = b.shape
     dtype = a.dtype
     c = torch.empty((M, N), device=a.device, dtype=dtype)
-    bytes_per_elem = a.element_size()
-    flops_str = f"flops{bytes_per_elem * 8}"
-    blas_name = device_blas_name()
-    with proton.scope(f"{blas_name} [M={M}, N={N}, K={K}]",
-                      {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
-        device_blas.matmul(a, b, c)
+    # Execute cuBLAS (without Proton instrumentation to avoid measurement bias)
+    cublas.matmul(a, b, c)
     return c
 
 
