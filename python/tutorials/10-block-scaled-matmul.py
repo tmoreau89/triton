@@ -127,6 +127,14 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
 
 
+if torch.cuda.is_available():
+    from triton._C.libtriton import nvidia
+    cublas_workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    cublas = nvidia.cublas.CublasLt(cublas_workspace)
+else:
+    cublas = None
+
+
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
@@ -266,6 +274,36 @@ def block_scaled_matmul(a_desc, a_scale_desc, b_desc, b_scale_desc, dtype_dst, M
     return output
 
 
+def cublas_block_scaled_matmul(a, a_scale, b, b_scale, block_scale_type="nvfp4"):
+    """
+    cuBLAS block-scaled matmul baseline.
+
+    Args:
+        a: Input matrix A (M, K) - packed FP4 or FP8
+        a_scale: Scale factors for A (flattened)
+        b: Input matrix B (N, K) - packed FP4 or FP8, transposed
+        b_scale: Scale factors for B (flattened)
+        block_scale_type: One of "nvfp4", "mxfp4", "mxfp8", "mixed"
+
+    Returns:
+        output: Result matrix (M, N) in FP16
+    """
+    M, K_packed = a.shape
+    N, K_packed_b = b.shape
+    assert K_packed == K_packed_b, "K dimensions must match"
+
+    # Determine if we're using 1D scaling (VEC128) - always true for current block scaling
+    use_1d_scaling = True
+
+    # Create output tensor
+    output = torch.empty((M, N), dtype=torch.float16, device="cuda")
+
+    # Execute cuBLAS (without Proton instrumentation to avoid measurement bias)
+    cublas.block_scaled_matmul(a, b, output, a_scale, b_scale, use_1d_scaling)
+
+    return output
+
+
 def initialize_block_scaled(M, N, K, block_scale_type="nvfp4", compute_reference=False):
     BLOCK_M = 128
     BLOCK_N = 256
@@ -359,15 +397,31 @@ def initialize_block_scaled(M, N, K, block_scale_type="nvfp4", compute_reference
         "ELEM_PER_BYTE_B": ELEM_PER_BYTE_B,
         "VEC_SIZE": VEC_SIZE,
     }
-    return a_desc, a_scale_desc, b_desc, b_scale_desc, rep_m, rep_n, rep_k, configs, reference
+    
+    # Also return raw tensors for cuBLAS (before reshaping for TMA descriptors)
+    # Store original scales before 5D reshape
+    a_scale_cublas = a_scale.reshape(-1).contiguous()  # Flatten the 5D reshaped version
+    b_scale_cublas = b_scale.reshape(-1).contiguous()
+    
+    return a_desc, a_scale_desc, b_desc, b_scale_desc, rep_m, rep_n, rep_k, configs, reference, a, b, a_scale_cublas, b_scale_cublas
 
 
 def validate_block_scaled(M, N, K, block_scale_type="nvfp4"):
-    a_desc, a_scale, b_desc, b_scale, rep_m, rep_n, rep_k, configs, reference = initialize_block_scaled(
-        M, N, K, block_scale_type, compute_reference=True)
-    output = block_scaled_matmul(a_desc, a_scale, b_desc, b_scale, torch.float16, M, N, K, rep_m, rep_n, rep_k, configs)
+    results = initialize_block_scaled(M, N, K, block_scale_type, compute_reference=True)
+    a_desc, a_scale_desc, b_desc, b_scale_desc, rep_m, rep_n, rep_k, configs, reference = results[:9]
+    a, b, a_scale_cublas, b_scale_cublas = results[9:13]
+    
+    # Test Triton implementation
+    output = block_scaled_matmul(a_desc, a_scale_desc, b_desc, b_scale_desc, torch.float16, M, N, K, rep_m, rep_n, rep_k, configs)
     torch.testing.assert_close(reference, output.to(torch.float32), atol=1e-3, rtol=1e-3)
-    print(f"✅ (pass {block_scale_type})")
+    
+    # Test cuBLAS implementation if available
+    if cublas is not None and supports_block_scaling():
+        cublas_output = cublas_block_scaled_matmul(a, a_scale_cublas, b, b_scale_cublas, block_scale_type)
+        torch.testing.assert_close(reference, cublas_output.to(torch.float32), atol=1e-3, rtol=1e-3)
+        print(f"✅ (pass {block_scale_type} - Triton and cuBLAS)")
+    else:
+        print(f"✅ (pass {block_scale_type} - Triton only)")
 
 
 def bench_block_scaled(K, block_scale_type="nvfp4", reps=10):
@@ -376,13 +430,21 @@ def bench_block_scaled(K, block_scale_type="nvfp4", reps=10):
     N = 8192
     print(f"Problem Shape = {M}x{N}x{K}")
 
-    a_desc, a_scale, b_desc, b_scale, rep_m, rep_n, rep_k, configs, _ = initialize_block_scaled(
-        M, N, K, block_scale_type, compute_reference=False)
-    _ = block_scaled_matmul(a_desc, a_scale, b_desc, b_scale, torch.float16, M, N, K, rep_m, rep_n, rep_k, configs)
-
+    results = initialize_block_scaled(M, N, K, block_scale_type, compute_reference=False)
+    a_desc, a_scale_desc, b_desc, b_scale_desc, rep_m, rep_n, rep_k, configs, _ = results[:9]
+    a, b, a_scale_cublas, b_scale_cublas = results[9:13]
+    
+    # Warmup
+    _ = block_scaled_matmul(a_desc, a_scale_desc, b_desc, b_scale_desc, torch.float16, M, N, K, rep_m, rep_n, rep_k, configs)
+    if cublas is not None and supports_block_scaling():
+        _ = cublas_block_scaled_matmul(a, a_scale_cublas, b, b_scale_cublas, block_scale_type)
+    
+    # Benchmark
     proton.activate(0)
     for _ in range(reps):
-        _ = block_scaled_matmul(a_desc, a_scale, b_desc, b_scale, torch.float16, M, N, K, rep_m, rep_n, rep_k, configs)
+        _ = block_scaled_matmul(a_desc, a_scale_desc, b_desc, b_scale_desc, torch.float16, M, N, K, rep_m, rep_n, rep_k, configs)
+        if cublas is not None and supports_block_scaling():
+            _ = cublas_block_scaled_matmul(a, a_scale_cublas, b, b_scale_cublas, block_scale_type)
     proton.deactivate(0)
     print("Done benchmarking")
 
